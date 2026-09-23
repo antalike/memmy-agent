@@ -85,7 +85,57 @@ describe("native Codex ingestion", () => {
     expect(stats.completedConversationIds).toEqual(["native-conversation"]);
     expect(markSeen).toHaveBeenCalledTimes(2);
   });
+
+  it("emits add started/succeeded analytics for a stored native turn", async () => {
+    const events: Array<{ name: string; payload: Record<string, unknown> }> = [];
+    const completeSourceTurn = vi.fn().mockResolvedValue({ status: "stored", result: { l1MemoryIds: ["l1-native"] } });
+    await createService({ completeSourceTurn }, {}, undefined, recordAddAnalytics(events))
+      .ingest(toAsyncIterable(nativeMessages()), { sourceId: "codex", scanMode: "incremental" });
+    expect(events.map((event) => event.name)).toEqual(["started", "succeeded"]);
+    expect(events[1]?.payload).toMatchObject({
+      adapterId: "agent-source:codex",
+      conversationId: "native-conversation",
+      turnId: "native-turn",
+      scanMode: "incremental",
+      storedCount: 1
+    });
+    expect(typeof events[1]?.payload.durationMs).toBe("number");
+  });
+
+  it.each(["existing", "rejected", "pending", "conflict"])("does not emit add analytics for a %s native turn", async (status) => {
+    const events: Array<{ name: string; payload: Record<string, unknown> }> = [];
+    const completeSourceTurn = vi.fn().mockResolvedValue({ status, result: { l1MemoryIds: ["l1-native"] } });
+    await createService({ completeSourceTurn }, {}, undefined, recordAddAnalytics(events))
+      .ingest(toAsyncIterable(nativeMessages()), { sourceId: "codex" });
+    expect(events).toEqual([]);
+  });
+
+  it("emits add started/failed analytics when a native turn write throws", async () => {
+    const events: Array<{ name: string; payload: Record<string, unknown> }> = [];
+    const completeSourceTurn = vi.fn().mockRejectedValue(new Error("write failed"));
+    await createService({ completeSourceTurn }, {}, undefined, recordAddAnalytics(events))
+      .ingest(toAsyncIterable(nativeMessages()), { sourceId: "codex" });
+    expect(events.map((event) => event.name)).toEqual(["started", "failed"]);
+    expect(events[1]?.payload.error).toBeInstanceOf(Error);
+  });
+
+  it("does not emit add analytics for an incomplete native turn", async () => {
+    const events: Array<{ name: string; payload: Record<string, unknown> }> = [];
+    const completeSourceTurn = vi.fn();
+    await createService({ completeSourceTurn }, {}, undefined, recordAddAnalytics(events))
+      .ingest(toAsyncIterable(nativeMessages(false)), { sourceId: "codex" });
+    expect(completeSourceTurn).not.toHaveBeenCalled();
+    expect(events).toEqual([]);
+  });
 });
+
+function recordAddAnalytics(events: Array<{ name: string; payload: Record<string, unknown> }>) {
+  return {
+    trackAddStarted: (input: Record<string, unknown>) => events.push({ name: "started", payload: { ...input } }),
+    trackAddSucceeded: (input: Record<string, unknown>) => events.push({ name: "succeeded", payload: { ...input } }),
+    trackAddFailed: (input: Record<string, unknown>) => events.push({ name: "failed", payload: { ...input } })
+  };
+}
 
 describe("ingestion service", () => {
   it("imports each contiguous conversation as turn memories through memory add", async () => {

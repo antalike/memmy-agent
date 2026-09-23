@@ -23,6 +23,13 @@ function records(complete: boolean) {
 async function wait(executor: ReturnType<typeof createAgentSourceExecutor>) {
   await vi.waitFor(() => expect(executor.scanStatus().running).toBe(false));
 }
+function recordAddAnalytics(events: Array<{ name: string; payload: Record<string, unknown> }>) {
+  return {
+    trackAddStarted: (input: object) => { events.push({ name: "started", payload: { ...input } }); },
+    trackAddSucceeded: (input: object) => { events.push({ name: "succeeded", payload: { ...input } }); },
+    trackAddFailed: (input: object) => { events.push({ name: "failed", payload: { ...input } }); }
+  };
+}
 
 describe("Codex scan and Hook share the actual Memory lifecycle", () => {
   it.each(["hook", "scan"])("keeps one RawTurn, L1 and capture job when %s arrives first", async first => {
@@ -52,6 +59,59 @@ describe("Codex scan and Hook share the actual Memory lifecycle", () => {
       expect(repos.runtime.getEpisode(captured.episodeId)?.l1MemoryIds).toEqual([captured.l1MemoryId]);
       expect(repos.runtime.getRawTurn(captured.rawTurnId)?.toolCalls[0]).toMatchObject({ id: "read", input: { path: "src/main.ts" }, output: expect.stringContaining("source contents") });
       expect(db.db.prepare("SELECT COUNT(*) AS n FROM evolution_jobs WHERE job_type = 'import_summary'").get()).toEqual({ n: 0 });
+    } finally { await executor.dispose(); }
+  });
+
+  it.each([
+    { first: "scan", expected: ["started", "succeeded"] },
+    { first: "hook", expected: [] }
+  ])("reports scan add analytics only when the scan stores the turn ($first first)", async ({ first, expected }) => {
+    const { service, root } = fixture.createTestService({ config: { ...DEFAULT_MEMMY_CONFIG, userId: "scan-owner" } });
+    const path = join(root, "rollout.jsonl");
+    writeFileSync(path, records(true).map(record => JSON.stringify(record)).join("\n") + "\n");
+    const messages: RawCodexMessage[] = []; for await (const value of readCodexRollout(path)) messages.push(value);
+    const events: Array<{ name: string; payload: Record<string, unknown> }> = [];
+    const executor = createAgentSourceExecutor({ service, configPath: join(root, "config.yaml"),
+      resolveAgentSkillRoot: () => null,
+      memoryAddAnalytics: recordAddAnalytics(events),
+      sourceRegistry: createSourceRegistry([{ descriptor: { sourceId: "codex", displayName: "Codex", builtin: true, dataPath: root },
+        detect: async () => true, async *scan() { for (const message of messages) yield { ...message, sourceId: "codex", workspacePath: null, gitRoot: null }; } }]) });
+    try {
+      if (first === "hook") {
+        const turn = sourceTurnFromMessages(messages)!;
+        service.completeSourceTurn({ ...buildSourceTurnRequest(turn, "hook"), namespace: { source: "codex", profileId: "default", userId: "scan-owner" } });
+      }
+      await executor.startScan({ sourceId: "codex", mode: "initial_subset" }); await wait(executor);
+      expect(executor.scanStatus().error).toBeNull();
+      expect(events.map(item => item.name)).toEqual(expected);
+      if (first === "scan") {
+        expect(events[1]?.payload).toMatchObject({
+          adapterId: "agent-source:codex",
+          conversationId: "native-session",
+          turnId: "native-turn",
+          scanMode: "initial_subset",
+          storedCount: 1
+        });
+      }
+    } finally { await executor.dispose(); }
+  });
+
+  it("reports scan add failure when the native turn write throws", async () => {
+    const { service, root } = fixture.createTestService();
+    const path = join(root, "rollout.jsonl");
+    writeFileSync(path, records(true).map(record => JSON.stringify(record)).join("\n") + "\n");
+    vi.spyOn(service, "completeSourceTurn").mockImplementation(() => { throw new Error("write failed"); });
+    const events: Array<{ name: string; payload: Record<string, unknown> }> = [];
+    const executor = createAgentSourceExecutor({ service, configPath: join(root, "config.yaml"),
+      resolveAgentSkillRoot: () => null,
+      memoryAddAnalytics: recordAddAnalytics(events),
+      sourceRegistry: createSourceRegistry([{ descriptor: { sourceId: "codex", displayName: "Codex", builtin: true, dataPath: root },
+        detect: async () => true, async *scan() { for await (const message of readCodexRollout(path)) yield { ...message, sourceId: "codex", workspacePath: null, gitRoot: null }; } }]) });
+    try {
+      await executor.startScan({ sourceId: "codex", mode: "incremental" }); await wait(executor);
+      expect(events.map(item => item.name)).toEqual(["started", "failed"]);
+      expect(events[1]?.payload).toMatchObject({ adapterId: "agent-source:codex", scanMode: "incremental" });
+      expect(events[1]?.payload.error).toBeInstanceOf(Error);
     } finally { await executor.dispose(); }
   });
 

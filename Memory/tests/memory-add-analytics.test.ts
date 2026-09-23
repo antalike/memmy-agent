@@ -1,11 +1,77 @@
+import { mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
   MEMORY_DESKTOP_ADD_ANALYTICS_EVENTS,
   MEMORY_DESKTOP_ADD_MODE_AGENT_SOURCE_SCAN,
   buildMemoryDesktopScanAddParams,
+  createConfigAnalyticsIdentity,
   createMemoryDesktopAddAnalytics,
   hashAnalyticsId,
 } from "../src/server/memory-add-analytics.js";
+
+describe("createConfigAnalyticsIdentity", () => {
+  async function withConfig(run: (write: (yaml: string) => void, path: string) => void | Promise<void>) {
+    const root = mkdtempSync(join(tmpdir(), "memory-add-identity-"));
+    const path = join(root, "config.yaml");
+    let tick = 1_700_000_000;
+    const write = (yaml: string) => {
+      writeFileSync(path, yaml);
+      tick += 10;
+      utimesSync(path, tick, tick);
+    };
+    try { await run(write, path); } finally { rmSync(root, { recursive: true, force: true }); }
+  }
+
+  it("reports the logged-in account id and mode from the Desktop account projection", async () => {
+    await withConfig((write, path) => {
+      write("app:\n  cloudUuid: cloud-1\n  userId: user-1\n  userMode: account\n");
+      const identity = createConfigAnalyticsIdentity(path);
+      expect(identity.getUserId()).toBe("user-1");
+      expect(identity.getUserMode()).toBe("account");
+    });
+  });
+
+  it("omits the user id when the account is logged out and follows later config rewrites", async () => {
+    await withConfig((write, path) => {
+      write("app:\n  userId: stale-user\n  userMode: byok\n");
+      const identity = createConfigAnalyticsIdentity(path);
+      expect(identity.getUserId()).toBeNull();
+      expect(identity.getUserMode()).toBe("byok");
+      write("app:\n  cloudUuid: cloud-2\n  userId: user-2\n  userMode: account\n");
+      expect(identity.getUserId()).toBe("user-2");
+      expect(identity.getUserMode()).toBe("account");
+    });
+  });
+
+  it("returns no identity when the config is missing or the mode is unknown", async () => {
+    await withConfig((write, path) => {
+      expect(createConfigAnalyticsIdentity(path).getUserId()).toBeNull();
+      write("app:\n  cloudUuid: cloud-1\n  userId: user-1\n  userMode: something-else\n");
+      expect(createConfigAnalyticsIdentity(path).getUserMode()).toBeNull();
+    });
+  });
+
+  it("sends the config identity with desktop add events", async () => {
+    await withConfig(async (write, path) => {
+      write("app:\n  cloudUuid: cloud-1\n  userId: user-1\n  userMode: account\n");
+      const fetchImpl = vi.fn<typeof fetch>(async () => new Response(null, { status: 204 }));
+      const analytics = createMemoryDesktopAddAnalytics({
+        ...createConfigAnalyticsIdentity(path),
+        getClientId: () => "client-1",
+        getInstallationId: () => "install-1",
+        baseUrl: "https://example.test",
+        fetchImpl,
+      });
+      analytics.trackAddStarted({ adapterId: "agent-source:codex" });
+      await analytics.flush();
+      const body = JSON.parse(String(fetchImpl.mock.calls[0]?.[1]?.body));
+      expect(body.userId).toBe("user-1");
+      expect(body.events[0]?.params).toMatchObject({ user_id: "user-1", user_mode: "account" });
+    });
+  });
+});
 
 describe("memory-add-analytics", () => {
   it("hashes ids and builds scan add params with agent_source_scan mode and scan_mode", () => {

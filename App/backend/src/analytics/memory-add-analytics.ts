@@ -67,6 +67,35 @@ export function buildMemoryDesktopScanAddParams(input: MemoryDesktopScanAddBaseI
   });
 }
 
+type SourceTurnAddAnalytics = Pick<MemoryDesktopAddAnalytics, "trackAddStarted" | "trackAddSucceeded" | "trackAddFailed">;
+
+/** Only a newly stored native turn counts as an add; existing, rejected, pending and conflict results do not. */
+export function trackSourceTurnAddStored(
+  analytics: SourceTurnAddAnalytics | undefined,
+  base: MemoryDesktopScanAddBaseInput,
+  startedAt: number,
+  result: { status: string; result?: { l1MemoryIds?: readonly string[] } }
+): void {
+  if (!analytics || result.status !== "stored") return;
+  analytics.trackAddStarted(base);
+  analytics.trackAddSucceeded({
+    ...base,
+    durationMs: Date.now() - startedAt,
+    storedCount: result.result?.l1MemoryIds?.length ?? 0,
+  });
+}
+
+export function trackSourceTurnAddFailed(
+  analytics: SourceTurnAddAnalytics | undefined,
+  base: MemoryDesktopScanAddBaseInput,
+  startedAt: number,
+  error: unknown
+): void {
+  if (!analytics) return;
+  analytics.trackAddStarted(base);
+  analytics.trackAddFailed({ ...base, durationMs: Date.now() - startedAt, error });
+}
+
 export function createMemoryDesktopAddAnalytics(options: {
   getClientId?: () => string | null | undefined;
   getInstallationId?: () => string | null | undefined;

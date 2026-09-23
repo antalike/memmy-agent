@@ -263,4 +263,51 @@ describe("nonpersistent Codex scan window", () => {
     expect(add).not.toHaveBeenCalled();
     expect(repository.getConversationCheckpoint("codex", "old-conversation")).toBeNull();
   });
+
+  it("emits add analytics once for a stored native turn and not again on rescan", async () => {
+    const root = mkdtempSync(join(tmpdir(), "native-backend-scan-")); roots.push(root);
+    const store = createAppStateStore({ databasePath: join(root, "app.sqlite") }); stores.push(store);
+    const repository = store.repositories.agentSources;
+    const at = "2099-09-09T10:00:00.000Z";
+    const event = (type: string, payload: Record<string, unknown>) => ({ type, timestamp: at, payload });
+    writeFileSync(join(root, "rollout-analytics.jsonl"), [
+      event("session_meta", { id: "analytics-session" }),
+      event("event_msg", { type: "task_started", turn_id: "analytics-turn" }),
+      event("response_item", { type: "message", role: "user", content: [{ text: "Run tests" }] }),
+      event("response_item", { type: "message", role: "assistant", content: [{ text: "Tests passed" }] }),
+      event("event_msg", { type: "task_complete", turn_id: "analytics-turn" })
+    ].map((value) => JSON.stringify(value)).join("\n") + "\n");
+    const client = createMockMemoryClient();
+    const events: Array<{ name: string; payload: Record<string, unknown> }> = [];
+    const memoryAddAnalytics = {
+      trackAddStarted: (input: Record<string, unknown>) => { events.push({ name: "started", payload: { ...input } }); },
+      trackAddSucceeded: (input: Record<string, unknown>) => { events.push({ name: "succeeded", payload: { ...input } }); },
+      trackAddFailed: (input: Record<string, unknown>) => { events.push({ name: "failed", payload: { ...input } }); }
+    };
+    const service = createAgentSourceService({
+      sourceRegistry: createSourceRegistry([createCodexSourceAdapter({ sessionsRoot: root })]),
+      memoryClient: client, agentSourceRepository: repository,
+      ingestionService: createIngestionService({ memoryClient: client, agentSourceRepository: repository }),
+      skillDistributionService: { install: async () => undefined, uninstall: async () => undefined, installPlugin: async () => undefined, uninstallPlugin: async () => undefined },
+      memoryAddAnalytics: memoryAddAnalytics as never,
+      scanStoreDirectory: join(root, "scans")
+    });
+
+    const completeSourceTurn = vi.spyOn(client, "completeSourceTurn");
+    const first = await service.scanOne("codex", { scanJobId: "analytics-first", mode: "initial_subset" });
+    expect(first.errors).toEqual([]);
+    expect(completeSourceTurn).toHaveBeenCalledOnce();
+    expect(events.map((item) => item.name)).toEqual(["started", "succeeded"]);
+    expect(events[1]?.payload).toMatchObject({
+      adapterId: "agent-source:codex",
+      conversationId: "analytics-session",
+      turnId: "analytics-turn",
+      scanMode: "initial_subset",
+      storedCount: 1
+    });
+
+    events.length = 0;
+    await service.scanOne("codex", { scanJobId: "analytics-second", mode: "incremental" });
+    expect(events).toEqual([]);
+  });
 });

@@ -4,9 +4,11 @@ import { orderedTurns, sourceTurnFromMessages, sourceTurnFailureReason, buildSou
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import type { ConversationMessage } from "../adapters/outbound/agent-source/types.js";
 import type { MemoryClient } from "../adapters/outbound/memory-client/index.js";
-import type {
-  MemoryDesktopAddAnalytics,
-  MemoryDesktopAddScanMode
+import {
+  trackSourceTurnAddFailed,
+  trackSourceTurnAddStored,
+  type MemoryDesktopAddAnalytics,
+  type MemoryDesktopAddScanMode
 } from "../analytics/memory-add-analytics.js";
 import type { AgentSourceRepository } from "../infrastructure/agent-source-store/index.js";
 
@@ -318,8 +320,16 @@ async function processNativeConversation(
       emitIngestionProgress(ctx, stats);
       continue;
     }
+    const addAnalyticsBase = {
+      adapterId: `agent-source:${ctx.sourceId}`,
+      conversationId: sourceTurn.conversationId,
+      turnId: sourceTurn.turnId,
+      ...(ctx.scanMode ? { scanMode: ctx.scanMode } : {})
+    };
+    const addStartedAt = Date.now();
     try {
       const result = await options.memoryClient.completeSourceTurn(buildSourceTurnRequest(sourceTurn, "agent_source_scan"));
+      trackSourceTurnAddStored(options.memoryAddAnalytics, addAnalyticsBase, addStartedAt, result);
       if (result.status === "pending" || result.status === "conflict") {
         failed = true;
         stats.failed += turn.messages.length;
@@ -345,6 +355,7 @@ async function processNativeConversation(
       stats.failed += turn.messages.length;
       stats.failedMemories += 1;
       reportItemSkip(options, ctx, turn.conversationId, error instanceof Error ? error.message : "native turn ingestion failed");
+      trackSourceTurnAddFailed(options.memoryAddAnalytics, addAnalyticsBase, addStartedAt, error);
     }
     emitIngestionProgress(ctx, stats);
   }

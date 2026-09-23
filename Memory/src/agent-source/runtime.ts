@@ -62,9 +62,11 @@ import {
 } from "./integration/target-registry.js";
 import { renderMemmyDefaultSkillManifest } from "./integration/templates/memmy-default.js";
 import { createWorkbuddySkillTarget } from "./integration/workbuddy/index.js";
-import type {
-  MemoryDesktopAddAnalytics,
-  MemoryDesktopAddScanMode
+import {
+  trackSourceTurnAddFailed,
+  trackSourceTurnAddStored,
+  type MemoryDesktopAddAnalytics,
+  type MemoryDesktopAddScanMode
 } from "../server/memory-add-analytics.js";
 
 const logger = createMemoryLogger("agent-source");
@@ -813,18 +815,27 @@ async function ingestStagedMessages(
       onProgress({ sourceId, phase: "add", current: processed, total: store.count(sourceId), message: "Capturing conversation turns" });
       continue;
     }
+    const resolvedScanMode = persistentScanMode(store.getSourceState(sourceId)?.mode ?? scanMode);
     if (hasStagedSourceTurn(turn.messages[0])) {
+      const sourceTurn = sourceTurnFromMessages(turn.messages);
+      if (!sourceTurn) {
+        const reason = sourceTurnFailureReason(turn.messages);
+        recordScanItemSkip(store, sourceId, turn.conversationId, reason);
+        noteUncommittedSkip(reason);
+        processed += turn.messages.length;
+        onProgress({ sourceId, phase: "add", current: processed, total: store.count(sourceId), message: "Capturing conversation turns" });
+        continue;
+      }
+      const sourceTurnAnalyticsBase = {
+        adapterId: `agent-source:${sourceId}`,
+        conversationId: sourceTurn.conversationId,
+        turnId: sourceTurn.turnId,
+        ...(resolvedScanMode ? { scanMode: resolvedScanMode } : {})
+      };
+      const sourceTurnStartedAt = Date.now();
       try {
-        const sourceTurn = sourceTurnFromMessages(turn.messages);
-        if (!sourceTurn) {
-          const reason = sourceTurnFailureReason(turn.messages);
-          recordScanItemSkip(store, sourceId, turn.conversationId, reason);
-          noteUncommittedSkip(reason);
-          processed += turn.messages.length;
-          onProgress({ sourceId, phase: "add", current: processed, total: store.count(sourceId), message: "Capturing conversation turns" });
-          continue;
-        }
         const result = service.completeSourceTurn(buildSourceTurnRequest(sourceTurn, "agent_source_scan"));
+        trackSourceTurnAddStored(memoryAddAnalytics, sourceTurnAnalyticsBase, sourceTurnStartedAt, result);
         if (result.status === "pending" || result.status === "conflict") {
           const reason = result.reason ?? result.status;
           recordScanItemSkip(store, sourceId, turn.conversationId, reason);
@@ -843,13 +854,13 @@ async function ingestStagedMessages(
         const reason = error instanceof Error ? error.message : "native turn ingestion failed";
         recordScanItemSkip(store, sourceId, turn.conversationId, reason);
         noteUncommittedSkip(reason);
+        trackSourceTurnAddFailed(memoryAddAnalytics, sourceTurnAnalyticsBase, sourceTurnStartedAt, error);
       }
       processed += turn.messages.length;
       onProgress({ sourceId, phase: "add", current: processed, total: store.count(sourceId), message: "Capturing conversation turns" });
       continue;
     }
     let succeeded = true;
-    const resolvedScanMode = persistentScanMode(store.getSourceState(sourceId)?.mode ?? scanMode);
     const addAnalyticsBase = {
       adapterId: `agent-source:${sourceId}`,
       conversationId: turn.conversationId,

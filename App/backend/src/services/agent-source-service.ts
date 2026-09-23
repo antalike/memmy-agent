@@ -39,9 +39,11 @@ import {
   type AgentSourceInstallType,
   type AgentSourceLifecycleAnalytics,
 } from "../analytics/agent-source-analytics.js";
-import type {
-  MemoryDesktopAddAnalytics,
-  MemoryDesktopAddScanMode
+import {
+  trackSourceTurnAddFailed,
+  trackSourceTurnAddStored,
+  type MemoryDesktopAddAnalytics,
+  type MemoryDesktopAddScanMode
 } from "../analytics/memory-add-analytics.js";
 import { errorCodeFromUnknown } from "../analytics/analytics-transport.js";
 import {
@@ -906,17 +908,25 @@ async function ingestPersistentSource(
     }
     const scanMode = persistentScanMode(store.getSourceState(sourceId)?.mode ?? scanOptions.mode);
     if (hasStagedSourceTurn(turn.messages[0]) || sourceId === "codex") {
+      const sourceTurn = sourceTurnFromMessages(turn.messages);
+      if (!sourceTurn) {
+        const reason = sourceTurnFailureReason(turn.messages);
+        skipPersistentTurn(store, sourceId, turn.conversationId, reason);
+        noteUncommittedSkip(reason);
+        processed += turn.messages.length;
+        emitAddProgress("Capturing conversation turns");
+        continue;
+      }
+      const addAnalyticsBase = {
+        adapterId: `agent-source:${sourceId}`,
+        conversationId: sourceTurn.conversationId,
+        turnId: sourceTurn.turnId,
+        ...(scanMode ? { scanMode } : {})
+      };
+      const addStartedAt = Date.now();
       try {
-        const sourceTurn = sourceTurnFromMessages(turn.messages);
-        if (!sourceTurn) {
-          const reason = sourceTurnFailureReason(turn.messages);
-          skipPersistentTurn(store, sourceId, turn.conversationId, reason);
-          noteUncommittedSkip(reason);
-          processed += turn.messages.length;
-          emitAddProgress("Capturing conversation turns");
-          continue;
-        }
         const result = await options.memoryClient.completeSourceTurn(buildSourceTurnRequest(sourceTurn, "agent_source_scan"));
+        trackSourceTurnAddStored(options.memoryAddAnalytics, addAnalyticsBase, addStartedAt, result);
         if (result.status === "pending" || result.status === "conflict") {
           const reason = result.reason ?? result.status;
           skipPersistentTurn(store, sourceId, turn.conversationId, reason);
@@ -939,6 +949,7 @@ async function ingestPersistentSource(
         const reason = error instanceof Error ? error.message : "native turn ingestion failed";
         skipPersistentTurn(store, sourceId, turn.conversationId, reason);
         noteUncommittedSkip(reason);
+        trackSourceTurnAddFailed(options.memoryAddAnalytics, addAnalyticsBase, addStartedAt, error);
       }
       processed += turn.messages.length;
       emitAddProgress("Capturing conversation turns");

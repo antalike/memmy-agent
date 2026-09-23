@@ -31,6 +31,7 @@ import { MemoryServiceError, statusForCode } from "../utils/error.js";
 import { stableHash } from "../utils/id.js";
 import { resolveTimeZone } from "../utils/time.js";
 import {
+  createConfigAnalyticsIdentity,
   createMemoryDesktopAddAnalytics,
   type MemoryDesktopAddAnalytics,
 } from "./memory-add-analytics.js";
@@ -146,7 +147,8 @@ export function createMemoryHttpServer(options: MemoryHttpServerOptions): Server
     postHealthDelayMs: options.workerPostHealthDelayMs ?? DEFAULT_WORKER_POST_HEALTH_DELAY_MS
   });
   const pluginRuntimeAnalytics = options.pluginRuntimeAnalytics ?? createPluginRuntimeAnalytics();
-  const memoryAddAnalytics = options.memoryAddAnalytics ?? createMemoryDesktopAddAnalytics();
+  const memoryAddAnalytics = options.memoryAddAnalytics ??
+    createMemoryDesktopAddAnalytics(createConfigAnalyticsIdentity(options.configPath));
   const agentSources = options.agentSourceExecutor ?? createAgentSourceExecutor({
     service: options.service,
     configPath: options.configPath,
